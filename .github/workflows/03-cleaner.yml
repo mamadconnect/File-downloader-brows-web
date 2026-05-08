@@ -1,0 +1,155 @@
+# GitHub Actions workflow to completely clean (delete) all files inside the downloads/ folder.
+# This is a destructive operation - it removes all downloaded files from the repository.
+# After cleaning, it creates a fresh downloads/ folder with a README.md indicating no files are present.
+# Triggered manually via workflow_dispatch with a warning input to prevent accidental runs.
+
+name: 🗑 3-Clean downloads folder
+
+on:
+  workflow_dispatch:
+    inputs:
+      warning:
+        description: '⚠️ WARNING: This will DELETE ALL files inside downloads/ folder. Click "Run workflow" only if you are sure.'
+        required: false
+        default: 'Read this warning before proceeding'
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10                    # Short timeout; cleaning is fast
+    permissions:
+      contents: write                      # Needed to delete files and push changes
+
+    steps:
+      # Step 1: Check out the repository with full history (to work with git rm)
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0                    # Full history for proper rebasing
+
+      # Step 2: Set Git user identity (required for commits)
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      # Step 3: Remove the entire downloads folder from Git and the filesystem,
+      #         then recreate it with a placeholder README.md so the folder is tracked.
+      - name: Remove downloads folder from Git and recreate with README
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+
+          echo "Cleaning downloads folder"
+          echo ""
+
+          # Check if the downloads folder exists (either tracked or untracked)
+          if [ -d "downloads" ]; then
+            echo "Removing downloads folder from Git tracking..."
+
+            # Use 'git rm -rf' to stage the deletion of all tracked files in downloads/
+            # The redirection to /dev/null suppresses error messages if no files are tracked.
+            git rm -rf downloads/ 2>/dev/null || true
+
+            # Also delete any untracked files/directories that may remain
+            rm -rf downloads 2>/dev/null || true
+
+            echo "Downloads folder removed from Git"
+          else
+            echo "Downloads folder doesn't exist, creating new one..."
+          fi
+
+          # Create a fresh empty downloads/ directory
+          mkdir -p downloads
+
+          # IMPORTANT: Git does NOT track empty folders!
+          # We must add at least one file inside so the folder appears in the repository after push.
+          # Create a README.md that clearly states that no files have been downloaded yet.
+          {
+            echo "# Downloads"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## NO FILE DOWNLOADED YET!"
+            echo ""
+            echo "Use the download workflows to add files here."
+            echo ""
+            echo "---"
+          } > downloads/README.md
+
+          echo "Created downloads/README.md"
+
+          # Stage the new README file (this also stages the parent folder because it contains a file)
+          git add downloads/README.md
+
+          # If there are no changes to commit (i.e., the folder was already clean), exit early.
+          if git diff --staged --quiet; then
+            echo ""
+            echo "No changes detected - downloads folder is already clean"
+            exit 0
+          fi
+
+          # Commit the deletion and the new README
+          git commit -m "Clean downloads folder [skip ci]"
+
+          echo ""
+          echo "Pushing changes..."
+
+          # Push with retry mechanism to handle possible transient failures (e.g., network issues, concurrent pushes)
+          RETRY=0
+          MAX_RETRIES=5
+          while [ $RETRY -lt $MAX_RETRIES ]; do
+            RETRY=$((RETRY + 1))
+
+            # Fetch the latest remote changes to avoid conflicts
+            git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+
+            # Try to rebase our commit on top of the remote branch
+            git rebase origin/"$BRANCH" 2>/dev/null || {
+              # If rebase fails, we need to recover:
+              # - Abort any in-progress rebase
+              # - Reset to one commit before (undo our local commit)
+              # - Pull with rebase to get latest remote
+              git rebase --abort 2>/dev/null || true
+              git reset --hard HEAD~1 2>/dev/null || true
+              git pull --rebase origin "$BRANCH" 2>/dev/null || true
+
+              # Recreate our changes (clean folder and README) after the failed rebase
+              mkdir -p downloads
+              git rm -rf downloads/ 2>/dev/null || true
+              rm -rf downloads 2>/dev/null || true
+              mkdir -p downloads
+              {
+                echo "# Downloads"
+                echo ""
+                echo "---"
+                echo ""
+                echo "## NO FILE DOWNLOADED YET!"
+                echo ""
+                echo "Use the download workflows to add files here."
+                echo ""
+                echo "---"
+              } > downloads/README.md
+
+              # Stage everything again and commit
+              git add -A downloads/
+              git commit -m "Clean downloads folder [skip ci]" 2>/dev/null || true
+            }
+
+            # Try to push with a 60-second timeout (large pushes shouldn't happen because we only have a tiny README)
+            if timeout 60 git push origin HEAD:"$BRANCH" 2>&1; then
+              echo ""
+              echo "=========================================="
+              echo "✅ Downloads folder cleared successfully!"
+              echo "=========================================="
+              exit 0
+            else
+              echo "Push failed, retry $RETRY/$MAX_RETRIES..."
+              # Wait a random time between 2 and 6 seconds before retrying (exponential backoff simulated)
+              sleep $((2 + RANDOM % 5))
+            fi
+          done
+
+          # If we exit the loop, all retries have failed
+          echo "❌ Failed to push after $MAX_RETRIES attempts"
+          exit 1

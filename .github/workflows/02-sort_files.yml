@@ -1,0 +1,65 @@
+# GitHub Actions workflow to organize split files (zip parts, deb, part) into subfolders.
+# This helps keep the downloads/ directory tidy when files are split across multiple parts.
+# Triggered manually via workflow_dispatch.
+
+name: 📝 2-Sort files
+
+on:
+  workflow_dispatch:          # Manual trigger only - no automatic runs
+
+jobs:
+  sort:
+    runs-on: ubuntu-latest
+    # Need write permission to move files and commit changes
+    permissions:
+      contents: write
+
+    steps:
+      # Step 1: Check out the repository so we can modify files in downloads/
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Step 2: Group split files (zip parts, .deb, .part) into subfolders based on their base name
+      - name: Group split zip/deb/part files into subfolders
+        run: |
+          # Move into the downloads directory; exit gracefully if it doesn't exist
+          cd downloads || exit 0
+
+          # Iterate over all files in downloads/
+          for file in *; do
+            if [[ -f "$file" ]]; then
+              # Remove common split-file extensions to get the base name
+              base="${file%.zip}"               # Remove .zip suffix
+              base="${base%.z[0-9][0-9]}"       # Remove .z01, .z02, ... .z99 suffix
+              base="${base%.deb}"               # Remove .deb suffix
+              base="${base%.part}"              # Remove .part suffix (often used by partial downloads)
+              
+              # If the base name is different from the original file name, it's a split/partial file
+              if [[ "$base" != "$file" ]]; then
+                echo "📁 Creating folder: $base"
+                mkdir -p "$base"
+                # Move all files that match the base name (regardless of extension) into the new folder
+                mv "$base".* "$base"/ 2>/dev/null || true
+              fi
+            fi
+          done
+
+      # Step 3: Commit and push the organized folder structure back to the repository
+      - name: Commit and push organized structure
+        run: |
+          # Set Git user identity for the commit
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          # Stage all changes inside downloads/ (new folders, moved files)
+          git add downloads/
+          # If there are no changes (nothing to move), skip commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Organize split files into folders [skip ci]"
+            # Pull latest changes with rebase to avoid merge conflicts
+            git pull --rebase origin "${{ github.ref_name }}"
+            git push origin HEAD:"${{ github.ref_name }}"
+            echo "✅ Sorting changes pushed"
+          fi
